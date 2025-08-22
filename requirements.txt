@@ -1,7 +1,10 @@
-flask
-line-bot-sdk
-google-api-python-client
-google-auth
-google-auth-httplib2
-google-auth-oauthlib
-gunicorn
+Flask==3.0.3
+gunicorn==21.2.0
+line-bot-sdk==3.5.0
+
+google-api-python-client==2.140.0
+google-auth==2.33.0
+google-auth-httplib2==0.2.0
+googleapis-common-protos==1.63.2
+
+pytz==2024.1
