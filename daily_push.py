@@ -1,11 +1,11 @@
-# daily_push.py - Render 的排程入口
+# daily_push.py - Render Cron entrypoint
 import os
 from typing import Dict, List, Tuple
-import pytz
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
+
 from gcal_utils import get_tomorrow_events, format_events_tw
-from sheets_utils import load_patients  # 目前用 CSV；之後可改 Google Sheet
+from sheets_utils import read_patients
 
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei")
 MY_EMAIL = os.getenv("MY_EMAIL", "")
@@ -19,7 +19,7 @@ if not CHANNEL_ACCESS_TOKEN:
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 
 def _patients_map() -> Dict[str, str]:
-    rows = load_patients()
+    rows = read_patients()
     mp = {}
     for r in rows:
         name = (r.get("realName") or r.get("displayName") or "").strip()
@@ -31,7 +31,6 @@ def _patients_map() -> Dict[str, str]:
 def _match_patient(summary: str, patients: Dict[str, str]) -> Tuple[str, str]:
     if not summary:
         return "", ""
-    # 先比長的，避免「小明」誤配到「小明明」
     for name in sorted(patients.keys(), key=len, reverse=True):
         if name and name in summary:
             return name, patients[name]
@@ -58,7 +57,6 @@ def main():
         else:
             not_matched.append(e["summary"])
 
-    # 傳摘要給管理者
     if ADMIN_USER_IDS:
         summary = ["⏰ 提醒（明天行程）", format_events_tw(events), ""]
         if sent_to:

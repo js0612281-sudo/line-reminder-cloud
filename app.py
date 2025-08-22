@@ -1,56 +1,85 @@
+# app.py - Flask LINE webhook (Render), save patients to Google Sheet
 import os
-import csv
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEvent
+
+# 這支工具會把使用者加入 Google 試算表（displayName, realName, userId）
+from sheets_utils import upsert_patient
+
+# --- 必填環境變數 ---
+CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "").strip()
+CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "").strip()
+if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
+    raise ValueError("缺少 CHANNEL_SECRET 或 CHANNEL_ACCESS_TOKEN（請到 Render > Settings > Environment 加上）")
+
+# 只有管理者、而且訊息以這個前綴開頭才會回覆（避免打擾病人）
+DEV_ONLY_PREFIX = os.getenv("DEV_ONLY_PREFIX", "#dev")
+ADMIN_USER_IDS = {u.strip() for u in os.getenv("ADMIN_USER_IDS", "").split(",") if u.strip()}
 
 app = Flask(__name__)
-
-CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
-CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
-
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-PATIENTS_CSV = "patients.csv"
+@app.get("/")
+def health():
+    return "OK"
 
-@app.route("/callback", methods=['POST'])
+@app.post("/callback")
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return 'OK'
+    return "OK"
 
+# 使用者「加入好友」時觸發：記錄 displayName + userId 到 Google Sheet
+@handler.add(FollowEvent)
+def on_follow(event: FollowEvent):
+    uid = event.source.user_id
+    display_name = ""
+    try:
+        prof = line_bot_api.get_profile(uid)
+        display_name = prof.display_name or ""
+    except Exception:
+        pass
+
+    # 寫進 Google Sheet（若 userId 已存在則只更新 displayName）
+    try:
+        upsert_patient(display_name, uid)
+    except Exception as e:
+        # 不影響使用者體驗，但在 log 記下
+        print(f"[SHEET UPSERT FAIL] {uid}: {e}")
+
+    # 可選：回一則簡短訊息（若完全不想回可註解掉）
+    try:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="加入成功 ✅ 我們已記錄您的顯示名稱；治療師稍後會更新為您的正式姓名。")
+        )
+    except Exception as e:
+        print(f"[FOLLOW REPLY FAIL] {uid}: {e}")
+
+# 訊息事件：只有「管理者 + 以 #dev 開頭」才回覆；其他一律靜默（避免打擾病人）
 @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    user_id = event.source.user_id
-    display_name = line_bot_api.get_profile(user_id).display_name
-    text = event.message.text.strip()
+def on_message(event: MessageEvent):
+    uid = event.source.user_id
+    text = (event.message.text or "").strip()
 
-    # 紀錄 userId
-    updated = False
-    rows = []
-    if os.path.exists(PATIENTS_CSV):
-        with open(PATIENTS_CSV, newline='', encoding='utf-8') as f:
-            rows = list(csv.DictReader(f))
+    is_admin = uid in ADMIN_USER_IDS
+    is_dev = DEV_ONLY_PREFIX and text.startswith(DEV_ONLY_PREFIX)
 
-    exists = False
-    for row in rows:
-        if row['userId'] == user_id:
-            exists = True
-            break
-    if not exists:
-        rows.append({'displayName': display_name, 'realName': '', 'userId': user_id})
-        with open(PATIENTS_CSV, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['displayName','realName','userId'])
-            writer.writeheader()
-            writer.writerows(rows)
-
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="收到訊息: " + text))
+    if is_admin and is_dev:
+        reply_text = text[len(DEV_ONLY_PREFIX):].strip() or "(空訊息)"
+        try:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        except Exception as e:
+            print(f"[ADMIN REPLY FAIL] {uid}: {e}")
+    # 非 admin 或沒有 #dev 前綴：不回覆
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", 3000))
+    app.run(host="0.0.0.0", port=port)
