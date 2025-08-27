@@ -8,7 +8,7 @@ from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
 from gcal_utils import get_tomorrow_events
-from sheets_utils import get_patients  # 讀取 Google Sheet 的 displayName/realName/userId
+from sheets_utils import read_patients  # ← 修正：使用 read_patients()
 
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei").strip()
 MY_EMAIL = os.getenv("MY_EMAIL", "").strip()
@@ -30,7 +30,6 @@ if not ADMIN_USER_IDS:
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 
 # ---------- 名字抽取：支援「8外- 李家森 2」、「門診-王小明」等 ----------
-# 取「最後一個 '-' 後面」到尾端，去掉尾端數字/空白
 NAME_RE = re.compile(r".*-\s*([^\d\-\(\)（）]+?)(?:\s*\d+)?\s*$")
 
 def extract_patient_name(summary: str) -> str:
@@ -45,10 +44,8 @@ def extract_patient_name(summary: str) -> str:
 
 def tw_time_str(iso_str: str) -> str:
     """把 ISO 轉成 'MM 月 DD 日 HH:MM'（台灣常用）"""
-    from datetime import datetime
     from dateutil import parser
-    dt = parser.isoparse(iso_str)
-    dt = dt.astimezone()  # 轉成本地時區
+    dt = parser.isoparse(iso_str).astimezone()
     return dt.strftime("%m 月 %d 日 %H:%M")
 
 
@@ -57,9 +54,7 @@ def build_patient_msg(start_iso: str) -> str:
 
 
 def group_events_for_me(events: List[Dict]) -> Tuple[str, List[Dict]]:
-    """
-    將我的行程整理成給管理者看的摘要（只含我自己），並回傳「找不到 userId」的清單方便補資料。
-    """
+    """將我的行程整理成給管理者看的摘要（只含我自己），並回傳找不到 userId 的清單。"""
     if not events:
         return "提醒（明天行程）\n明天沒有任何排程 ✅", []
 
@@ -69,25 +64,22 @@ def group_events_for_me(events: List[Dict]) -> Tuple[str, List[Dict]]:
         title = ev.get("summary", "")
         loc = ev.get("location", "")
         s = tw_time_str(ev["start"])
-        # 給管理者看的行數
         lines.append(f"．{s}　{title}" + (f"（{loc}）" if loc else ""))
 
     return "\n".join(lines), not_matched
 
 
 def main():
-    # 1) 讀日曆（只會拿「你自己的」行程；過濾在 gcal_utils 已經做了）
+    # 1) 只拿「你的」行程（gcal_utils 已過濾 creator/organizer/attendee 為你）
     events = get_tomorrow_events(TIMEZONE, CALENDAR_IDS, MY_EMAIL)
 
-    # 2) 讀病人清單（Google Sheet）
-    #    格式：displayName, realName, userId
-    pats = get_patients()
-    # 建兩個索引：displayName 與 realName 都能對到
+    # 2) 讀病人清單（Google Sheet：displayName, realName, userId）
+    pats = read_patients()  # ← 修正：read_patients()
     by_display: Dict[str, str] = { (p.get("displayName") or "").strip(): (p.get("userId") or "").strip() for p in pats if p.get("userId") }
-    by_real: Dict[str, str] = { (p.get("realName") or "").strip(): (p.get("userId") or "").strip() for p in pats if p.get("userId") }
+    by_real:   Dict[str, str] = { (p.get("realName")   or "").strip(): (p.get("userId") or "").strip() for p in pats if p.get("userId") }
 
     # 3) 逐一行程 → 找病人 → 推播
-    not_found: List[str] = []  # 找不到 userId 的名字，待你補資料
+    not_found: List[str] = []
     for ev in events:
         name = extract_patient_name(ev.get("summary", ""))
         if not name:
@@ -98,12 +90,11 @@ def main():
             try:
                 line_bot_api.push_message(uid, TextSendMessage(text=build_patient_msg(ev["start"])))
             except Exception as e:
-                # 就算病人發送失敗，也不要影響後續流程；留待摘要告知你
                 not_found.append(f"{name}（推播失敗：{e}）")
         else:
             not_found.append(name)
 
-    # 4) 給管理者（只含你的行程清單；另外列出找不到 userId 的名單）
+    # 4) 管理者摘要（只含你的行程）＋ 待補名單
     admin_text, _ = group_events_for_me(events)
     if not_found:
         admin_text += "\n\n【待補名單】\n- " + "\n- ".join(sorted(set(not_found)))
