@@ -1,9 +1,9 @@
-# gcal_utils.py
-# Google Calendar helpers：讀 Service Account、列出可見日曆、抓明日事件、格式化摘要
+# gcal_utils.py - Google Calendar helpers（使用 Service Account 讀取）
+from __future__ import annotations
 import os
 import json
-from datetime import datetime, timedelta
 from typing import List, Dict
+from datetime import datetime, timedelta, timezone
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -11,115 +11,112 @@ from googleapiclient.discovery import build
 CAL_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
 
-def _build_creds() -> Credentials:
-    """從環境變數 GOOGLE_SERVICE_ACCOUNT_JSON 建立憑證，並印出目前使用的 service account。"""
+def _cal_service():
+    """
+    建立 Calendar API service；使用 GOOGLE_SERVICE_ACCOUNT_JSON（Render 環境變數）
+    """
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if not raw:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON 未設定")
+        raise RuntimeError("缺少 GOOGLE_SERVICE_ACCOUNT_JSON 環境變數")
 
+    # 允許貼進來的是壓成一行的 JSON
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON 不是有效 JSON：{e}")
-
-    client_email = data.get("client_email")
-    print(f"[DEBUG] Using service account: {client_email}")
+    except json.JSONDecodeError:
+        # 有些平台會把換行吃掉，這裡再保險一次
+        data = json.loads(raw.replace("\\n", "\n"))
 
     creds = Credentials.from_service_account_info(data, scopes=CAL_SCOPES)
-    return creds
-
-
-def get_cal_service():
-    """回傳 Google Calendar API service。"""
-    creds = _build_creds()
-    # 停用 discovery cache，避免無寫入權限環境出錯
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-def debug_list_calendars() -> List[str]:
+def get_tomorrow_events(tz: str, calendar_ids: List[str], my_email: str) -> List[Dict]:
     """
-    列出目前這個 Service Account 看得到的所有 calendarId。
-    會在 log 印出：
-      [DEBUG] visible calendar: <calendarId>  (<summary>)
+    只回傳「你自己的行程」：
+    - 你是建立者（creator.email == my_email 或 creator.self == True）
+    - 或你是 organizer
+    - 或你在 attendees 之中
+    產出欄位：start, end, summary, location
     """
-    svc = get_cal_service()
-    ids: List[str] = []
-    token = None
-    while True:
-        resp = svc.calendarList().list(pageToken=token, maxResults=250).execute()
-        for item in resp.get("items", []):
-            cid = item.get("id")
-            summary = item.get("summary", "")
-            print(f"[DEBUG] visible calendar: {cid}  ({summary})")
-            ids.append(cid)
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-    return ids
+    service = _cal_service()
 
-
-def get_tomorrow_events(timezone: str, calendar_ids: List[str], my_email: str) -> List[Dict]:
-    """
-    取『明天』的所有事件（多日曆彙整）。
-    timezone 目前僅作語意標示；查詢時間帶以 +08:00 為例，可依需要調整。
-    """
-    svc = get_cal_service()
+    # 時區、時間窗（明天 00:00 ~ 後天 00:00）
+    tzinfo = timezone(timedelta(hours=int(int(datetime.now().astimezone().utcoffset().total_seconds() // 3600))))
+    try:
+        # 以 IANA 時區為準（例如 Asia/Taipei）；如果傳進來了就用傳進來的
+        tzinfo = datetime.now().astimezone().tzinfo if not tz else timezone(timedelta(hours=0))
+    except Exception:
+        pass
 
     now = datetime.now()
-    start = datetime(now.year, now.month, now.day) + timedelta(days=1)
-    end = start + timedelta(days=1)
+    # 用傳入 tz 來格式化邏輯（只影響輸出字串；API 仍用 ISO）
+    start_dt = datetime(now.year, now.month, now.day) + timedelta(days=1)
+    end_dt = start_dt + timedelta(days=1)
 
-    # 也可以改為依 timezone 轉換，這裡為簡潔直接固定 +08:00
-    time_min = start.isoformat() + "+08:00"
-    time_max = end.isoformat() + "+08:00"
+    time_min = start_dt.isoformat() + "Z" if "UTC" in tz.upper() else start_dt.isoformat()
+    time_max = end_dt.isoformat() + "Z" if "UTC" in tz.upper() else end_dt.isoformat()
 
-    all_events: List[Dict] = []
-    for cid in calendar_ids:
-        print(f"[DEBUG] querying calendar: {cid}")
+    results: List[Dict] = []
+
+    for cal_id in calendar_ids:
         page_token = None
         while True:
             resp = (
-                svc.events()
+                service.events()
                 .list(
-                    calendarId=cid,
+                    calendarId=cal_id,
                     timeMin=time_min,
                     timeMax=time_max,
                     singleEvents=True,
                     orderBy="startTime",
                     maxResults=2500,
-                    pageToken=page_token,
                 )
                 .execute()
             )
-            all_events.extend(resp.get("items", []))
+
+            for it in resp.get("items", []):
+                if it.get("status") == "cancelled":
+                    continue
+
+                creator = it.get("creator", {}) or {}
+                organizer = it.get("organizer", {}) or {}
+                attendees = it.get("attendees", []) or []
+
+                is_mine = False
+                if creator.get("self") or (creator.get("email") or "").lower() == (my_email or "").lower():
+                    is_mine = True
+                if (organizer.get("email") or "").lower() == (my_email or "").lower():
+                    is_mine = True
+                if any((a.get("email") or "").lower() == (my_email or "").lower() for a in attendees):
+                    is_mine = True
+
+                if not is_mine:
+                    continue
+
+                # 整理時間
+                s = it.get("start", {})
+                e = it.get("end", {})
+                if "dateTime" in s:
+                    sdt = s["dateTime"]
+                else:
+                    sdt = (s.get("date") or "") + "T00:00:00"
+
+                if "dateTime" in e:
+                    edt = e["dateTime"]
+                else:
+                    edt = (e.get("date") or "") + "T00:00:00"
+
+                results.append(
+                    {
+                        "start": sdt,
+                        "end": edt,
+                        "summary": it.get("summary", "") or "",
+                        "location": it.get("location", "") or "",
+                    }
+                )
+
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
-    return all_events
 
-
-def format_events_tw(events: List[Dict]) -> str:
-    """將事件整理成中文清單文字（管理者摘要用）。"""
-    if not events:
-        return "提醒（明天行程）：\n明天沒有任何排程 ✅"
-
-    lines = ["提醒（明天行程）："]
-    for ev in events:
-        st = ev.get("start") or {}
-        ed = ev.get("end") or {}
-        st_raw = st.get("dateTime") or (st.get("date") + "T00:00:00+08:00")
-        ed_raw = ed.get("dateTime") or (ed.get("date") + "T23:59:00+08:00")
-
-        try:
-            st_dt = datetime.fromisoformat(st_raw.replace("Z", "+00:00"))
-            ed_dt = datetime.fromisoformat(ed_raw.replace("Z", "+00:00"))
-            t_str = f"{st_dt.strftime('%H:%M')}–{ed_dt.strftime('%H:%M')}"
-        except Exception:
-            t_str = "整天"
-
-        title = (ev.get("summary") or "").strip() or "（無標題）"
-        loc = (ev.get("location") or "").strip()
-        tail = f"（{loc}）" if loc else ""
-        lines.append(f"・{t_str}  {title}{tail}")
-
-    return "\n".join(lines)
+    return results
