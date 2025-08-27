@@ -3,14 +3,17 @@ from __future__ import annotations
 import os
 import re
 from typing import Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
 from gcal_utils import get_tomorrow_events
-from sheets_utils import read_patients  # ← 修正：使用 read_patients()
+from sheets_utils import read_patients  # 讀取 Google Sheet 的 displayName/realName/userId
 
+# ---- 基本設定 ----
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei").strip()
+TZ = ZoneInfo(TIMEZONE)
 MY_EMAIL = os.getenv("MY_EMAIL", "").strip()
 
 # 多個日曆用逗號
@@ -43,14 +46,29 @@ def extract_patient_name(summary: str) -> str:
 
 
 def tw_time_str(iso_str: str) -> str:
-    """把 ISO 轉成 'MM 月 DD 日 HH:MM'（台灣常用）"""
+    """
+    把 ISO 轉成 'MM 月 DD 日 HH:MM'（固定轉成 TIMEZONE，例如 Asia/Taipei）。
+    若是整天事件（ISO 裡沒有時間），會回傳 'MM 月 DD 日 整天'
+    """
     from dateutil import parser
-    dt = parser.isoparse(iso_str).astimezone()
+    # 判斷是否為「只有日期」的整天事件
+    if len(iso_str) == 10 and iso_str.count("-") == 2:
+        # yyyy-mm-dd
+        dt = parser.isoparse(iso_str).replace(tzinfo=TZ)
+        return dt.strftime("%m 月 %d 日 整天")
+    # 一般有時間的事件
+    dt = parser.isoparse(iso_str)
+    if dt.tzinfo is None:
+        # 沒帶時區就視為目標時區
+        dt = dt.replace(tzinfo=TZ)
+    # 明確轉成台北時區顯示
+    dt = dt.astimezone(TZ)
     return dt.strftime("%m 月 %d 日 %H:%M")
 
 
 def build_patient_msg(start_iso: str) -> str:
-    return f"（提醒您：您的治療預約在 {tw_time_str(start_iso)}，如需更改請提前告知喔！！）"
+    when = tw_time_str(start_iso)
+    return f"（提醒您：您的治療預約在 {when}，如需更改請提前告知喔！！）"
 
 
 def group_events_for_me(events: List[Dict]) -> Tuple[str, List[Dict]]:
@@ -74,7 +92,7 @@ def main():
     events = get_tomorrow_events(TIMEZONE, CALENDAR_IDS, MY_EMAIL)
 
     # 2) 讀病人清單（Google Sheet：displayName, realName, userId）
-    pats = read_patients()  # ← 修正：read_patients()
+    pats = read_patients()
     by_display: Dict[str, str] = { (p.get("displayName") or "").strip(): (p.get("userId") or "").strip() for p in pats if p.get("userId") }
     by_real:   Dict[str, str] = { (p.get("realName")   or "").strip(): (p.get("userId") or "").strip() for p in pats if p.get("userId") }
 
