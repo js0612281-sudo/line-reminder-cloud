@@ -1,5 +1,7 @@
 # monthly_stats.py
-# 每天跑一次（建議設為每日凌晨），只有在「每月 1 號」時，才彙整「上個月」的人次並推送給管理者
+# 每天跑一次，只有在「每月 1 號」時，才彙整「上個月」的人次並推送給管理者
+# 修改紀錄：加入過濾機制，只統計包含 "-" 的行程，避免誤算私人行程。
+
 from __future__ import annotations
 import os
 import re
@@ -161,6 +163,13 @@ def summarize_month(events: List[Dict]) -> Tuple[int, int, int]:
     one_h = half_h = min45 = 0
     for ev in events:
         title = ev.get("summary", "")
+        
+        # --- 新增：關鍵過濾器 ---
+        # 如果標題裡面沒有「-」，就認定它是私人行程或雜事，直接跳過不統計
+        if "-" not in title:
+            continue
+        # ---------------------
+
         a, b, c = count_session_from_title(title)
         one_h += a
         half_h += b
@@ -171,7 +180,7 @@ def summarize_month(events: List[Dict]) -> Tuple[int, int, int]:
 def main():
     now = datetime.now(TZ)
     
-    # 修改關鍵：只在「每月 1 號」執行，否則直接結束
+    # 關鍵：只在「每月 1 號」執行，否則直接結束
     if now.day != 1:
         print(f"[INFO] Today is {now.day}, not the 1st day of month. Skip stats.")
         return
