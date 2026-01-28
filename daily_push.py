@@ -1,4 +1,6 @@
 # daily_push.py - Render 的 Cron 入口，用來在每天 16:00 推播
+# 修改紀錄：更新 extract_patient_name 邏輯，支援忽略行事曆標題後的括號與備註 (e.g. "8外-王小明 2 (1F)")
+
 from __future__ import annotations
 import os
 import re
@@ -32,16 +34,38 @@ if not ADMIN_USER_IDS:
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 
-# ---------- 名字抽取：支援「8外- 李家森 2」、「門診-王小明」等 ----------
-NAME_RE = re.compile(r".*-\s*([^\d\-\(\)（）]+?)(?:\s*\d+)?\s*$")
+# ---------- (舊的 NAME_RE 移除，改用新邏輯) ----------
 
 def extract_patient_name(summary: str) -> str:
+    """
+    從行事曆標題中抓取病人姓名。
+    邏輯：
+    1. 找到 '-' 號，取後面的字串。
+    2. 往後讀取，一旦遇到「數字」或「左括號 ( / （」，就切斷。
+    3. 去除前後空白即為名字。
+    
+    範例：
+    "8外- 張駿之 2 (1F)" -> "張駿之"
+    "門診-王小明(新患)" -> "王小明"
+    "8外- 李家森"       -> "李家森"
+    """
     s = (summary or "").strip()
-    m = NAME_RE.match(s)
-    if m:
-        return m.group(1).strip()
-    # 後備：如果沒有 '-'，就拿整行去掉尾端數字
-    s = re.sub(r"\s*\d+\s*$", "", s)
+    
+    # 1. 如果有 '-'，只取減號後面的部分 (e.g. "8外- 張駿之..." -> " 張駿之...")
+    if "-" in s:
+        # split 參數 1 代表只切第一刀，避免名字裡剛好也有減號(雖然少見)
+        s = s.split("-", 1)[1]
+    
+    # 2. 去除開頭空白
+    s = s.strip()
+
+    # 3. 用 Regex 找「第一個」干擾符號的位置 (數字、半形左括號、全形左括號)
+    # 只要遇到這些符號，就代表名字結束了
+    match = re.search(r"[\d\(\（]", s)
+    if match:
+        # 在干擾符號的位置切斷
+        s = s[:match.start()]
+    
     return s.strip()
 
 
@@ -82,6 +106,8 @@ def group_events_for_me(events: List[Dict]) -> Tuple[str, List[Dict]]:
         title = ev.get("summary", "")
         loc = ev.get("location", "")
         s = tw_time_str(ev["start"])
+        
+        # 在摘要裡顯示原始標題，方便核對
         lines.append(f"．{s}　{title}" + (f"（{loc}）" if loc else ""))
 
     return "\n".join(lines), not_matched
@@ -99,7 +125,14 @@ def main():
     # 3) 逐一行程 → 找病人 → 推播
     not_found: List[str] = []
     for ev in events:
-        name = extract_patient_name(ev.get("summary", ""))
+        # 使用新的抓名邏輯
+        summary = ev.get("summary", "")
+        
+        # 這裡加個保險：如果標題根本沒有 '-'，通常不是掛號，直接跳過 (避免抓到 "午休" 這種)
+        if "-" not in summary:
+            continue
+            
+        name = extract_patient_name(summary)
         if not name:
             continue
 
