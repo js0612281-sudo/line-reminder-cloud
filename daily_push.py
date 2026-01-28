@@ -92,7 +92,7 @@ def tw_time_str(iso_str: str) -> str:
 
 def build_patient_msg(start_iso: str) -> str:
     when = tw_time_str(start_iso)
-    return f"（提醒您：您的治療預約在 {when}，如需更改請提前告知喔！！）"
+    return f"提醒您：您的治療預約在 {when}，如需更改請提前告知喔！！"
 
 
 def group_events_for_me(events: List[Dict]) -> Tuple[str, List[Dict]]:
