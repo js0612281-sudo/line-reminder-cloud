@@ -1,6 +1,8 @@
 # monthly_stats.py
 # 每天跑一次，只有在「每月 1 號」時，才彙整「上個月」的人次並推送給管理者
-# 修改紀錄：加入過濾機制，只統計包含 "-" 的行程，避免誤算私人行程。
+# 修改紀錄：
+# 1. 加入過濾機制：只統計包含 "-" 的行程。
+# 2. 強化判讀邏輯：支援忽略行事曆標題後的括號與備註 (e.g. "8外-王小明 2 (1F)")。
 
 from __future__ import annotations
 import os
@@ -132,15 +134,18 @@ def fetch_my_events_in_range(start: datetime, end: datetime) -> List[Dict]:
 
     return results
 
-# ======== 解析：人次加總邏輯 ========
+# ======== 解析：人次加總邏輯 (含新版括號判斷) ========
 RE_45 = re.compile(r"(45\s*(?:min|分鐘|分)?)", re.IGNORECASE)
 RE_MULTI = re.compile(r"(\d)(?:\s*\+\s*(\d))+")
 
 def count_session_from_title(title: str) -> Tuple[int, int, int]:
     t = (title or "").strip()
+    
+    # 1. 先抓 45min
     if RE_45.search(t):
         return (0, 0, 1) # 45min
     
+    # 2. 再抓 1+1, 2+1 這種組合
     m_multi = RE_MULTI.search(t)
     if m_multi:
         hours = 0
@@ -151,25 +156,29 @@ def count_session_from_title(title: str) -> Tuple[int, int, int]:
             elif n == 1: halves += 1
         return (hours, halves, 0)
 
-    m_end = re.search(r"(\d)\s*$", t)
+    # 3. (強化版) 抓結尾數字，但允許數字後面跟著括號 (例如 "2 (1F)")
+    # 邏輯：找一個數字 (\d)，後面可能跟著空白 \s*，然後可能跟著括號內容 (?:\(.*\))?，最後是結尾 $
+    m_end = re.search(r"(\d)\s*(?:\(.*\)|（.*）)?\s*$", t)
+    
     if m_end:
         n = int(m_end.group(1))
-        if n == 2: return (1, 0, 0)
-        elif n == 1: return (0, 1, 0)
+        if n == 2: return (1, 0, 0) # 1小時
+        elif n == 1: return (0, 1, 0) # 半小時
     
-    return (0, 1, 0) # 預設半小時
+    # 4. 都沒抓到特徵，預設算半小時
+    return (0, 1, 0)
 
 def summarize_month(events: List[Dict]) -> Tuple[int, int, int]:
     one_h = half_h = min45 = 0
     for ev in events:
         title = ev.get("summary", "")
         
-        # --- 新增：關鍵過濾器 ---
+        # --- 關鍵過濾器 ---
         # 如果標題裡面沒有「-」，就認定它是私人行程或雜事，直接跳過不統計
         if "-" not in title:
             continue
-        # ---------------------
-
+        # ----------------
+        
         a, b, c = count_session_from_title(title)
         one_h += a
         half_h += b
@@ -181,6 +190,7 @@ def main():
     now = datetime.now(TZ)
     
     # 關鍵：只在「每月 1 號」執行，否則直接結束
+    # 如果你想測試，可以暫時註解掉底下這兩行
     if now.day != 1:
         print(f"[INFO] Today is {now.day}, not the 1st day of month. Skip stats.")
         return
