@@ -1,8 +1,7 @@
 # monthly_stats.py
 # 修改紀錄：
-# 1. 執行時間：自動判斷「當月倒數第二天」才執行 (解決大小月問題)。
-# 2. 統計範圍：當月1號 ~ 當月最後一天 (包含未來行程)。
-# 3. 需配合 Cron-job 設定為「每天」執行 (程式內部會自己過濾日期)。
+# 1. 將「產生報表文字」的邏輯拆解成 get_stats_report_text()，方便 app.py 隨時呼叫。
+# 2. main() 仍保留「倒數第二天」自動推播的功能。
 
 from __future__ import annotations
 import os
@@ -53,39 +52,23 @@ def _cal_service():
     creds = Credentials.from_service_account_info(info, scopes=CAL_SCOPES)
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
-# ======== 日期計算核心邏輯 ========
+# ======== 日期計算邏輯 ========
 
 def get_full_month_range(now: datetime) -> Tuple[datetime, datetime]:
-    """
-    回傳『當月 1 號 00:00』到『下個月 1 號 00:00』的區間。
-    這樣可以完整包含當月最後一天的所有行程。
-    """
-    # 1. 當月 1 號
+    """回傳『當月 1 號 00:00』到『下個月 1 號 00:00』(完整包含本月)"""
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
-    # 2. 下個月 1 號 (算法：先找到當月最後一天，再加一天)
-    # calendar.monthrange(year, month)[1] 會回傳當月有幾天
     days_in_month = calendar.monthrange(now.year, now.month)[1]
     last_day_date = now.replace(day=days_in_month)
-    end = last_day_date + timedelta(days=1) # 變成下個月1號
-    # 確保時間是 00:00
+    end = last_day_date + timedelta(days=1)
     end = end.replace(hour=0, minute=0, second=0, microsecond=0)
-    
     return start, end
 
 def is_second_to_last_day(now: datetime) -> bool:
-    """
-    判斷今天是否為當月的「倒數第二天」。
-    例如：
-    - 1月 (31天)：倒數第二天是 30號
-    - 2月 (28天)：倒數第二天是 27號
-    - 4月 (30天)：倒數第二天是 29號
-    """
     days_in_month = calendar.monthrange(now.year, now.month)[1]
-    target_day = days_in_month - 1 # 最後一天減 1
+    target_day = days_in_month - 1
     return now.day == target_day
 
-# ======== 抓取與統計 (維持原樣) ========
+# ======== 抓取與統計 ========
 
 def _iso(dt: datetime) -> str:
     if dt.tzinfo is None:
@@ -120,7 +103,6 @@ def fetch_my_events_in_range(start: datetime, end: datetime) -> List[Dict]:
                     if creator == me or organizer == me: is_mine = True
                     elif any((a.get("email") or "").lower() == me and a.get("responseStatus") != "declined" for a in attendees):
                         is_mine = True
-                
                 if not is_mine: continue
                 
                 results.append({
@@ -167,44 +149,48 @@ def summarize_month(events: List[Dict]) -> Tuple[int, int, int]:
         one_h += a; half_h += b; min45 += c
     return one_h, half_h, min45
 
-# ======== 主流程 ========
-def main():
-    now = datetime.now(TZ)
-    
-    # 1. 檢查今天是不是倒數第二天
-    if not is_second_to_last_day(now):
-        # 如果不是，就安靜地結束，不要吵你
-        print(f"[INFO] Today is {now.date()}, not the second to last day. Skip.")
-        return
-
-    print("[INFO] Target day matched! Generating full month stats...")
-
-    # 2. 計算範圍：月初 ~ 下月初 (完整包含本月最後一天)
-    start, end = get_full_month_range(now)
+# ======== 新增：產生報表文字的核心函式 (給 app.py 呼叫用) ========
+def get_stats_report_text(target_date: datetime) -> str:
+    """計算指定日期所在月份的完整業績，回傳文字報表"""
+    # 計算範圍：月初 ~ 下月初 (完整包含本月)
+    start, end = get_full_month_range(target_date)
     
     events = fetch_my_events_in_range(start, end)
     one_h, half_h, min45 = summarize_month(events)
 
     month_str = str(start.month)
     msg = (
-        f"📊【{month_str}月 全月統計預報】\n"
-        f"(統計至月底，含已安排行程)\n"
+        f"📊【{month_str}月 即時統計】\n"
+        f"(含本月所有已安排行程)\n"
         f"------------------\n"
         f"一小時：{one_h}\n"
         f"半小時：{half_h}\n"
         f"45分鐘：{min45}"
     )
+    return msg
+
+# ======== 主流程 (Cron Job 呼叫用) ========
+def main():
+    now = datetime.now(TZ)
+    
+    # 1. 自動檢查：如果不是倒數第二天，就安靜結束
+    if not is_second_to_last_day(now):
+        print(f"[INFO] Today is {now.date()}, not the second to last day. Skip.")
+        return
+
+    print("[INFO] Target day matched! Pushing monthly stats...")
+    
+    # 2. 呼叫核心函式取得報表
+    msg = get_stats_report_text(now)
 
     if not ADMIN_USER_IDS:
-        print("[WARN] ADMIN_USER_IDS empty.")
         return
 
     for uid in ADMIN_USER_IDS:
         try:
             line_bot_api.push_message(uid, TextSendMessage(text=msg))
-            print(f"[PUSH OK] -> {uid}")
-        except Exception as e:
-            print(f"[PUSH FAIL] -> {uid}: {e}", file=sys.stderr)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
