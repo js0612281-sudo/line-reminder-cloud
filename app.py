@@ -1,20 +1,23 @@
 # app.py - Flask LINE webhook (Render) + Task Triggers
+# 修改紀錄：新增「查業績」指令，手動觸發月報表回覆
+
 import os
 import traceback
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request, abort, jsonify
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEvent
 
-# 匯入原本的程式邏輯
+# 匯入工具
 from sheets_utils import upsert_patient
 import daily_push
-import monthly_stats
+import monthly_stats  # 匯入剛改好的統計模組
 
-# --- 1. 必填環境變數設定 ---
+# --- 必填環境變數 ---
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "").strip()
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "").strip()
-# 保護排程觸發的密鑰 (需與 Render Environment 及 cron-job.org 設定一致)
 CRON_SECRET = os.getenv("CRON_SECRET", "my-secret-key") 
 
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
@@ -24,16 +27,19 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 DEV_ONLY_PREFIX = os.getenv("DEV_ONLY_PREFIX", "#dev")
 ADMIN_USER_IDS = {u.strip() for u in os.getenv("ADMIN_USER_IDS", "").split(",") if u.strip()}
 
+# 時區設定 (給手動查詢用)
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei").strip()
+TZ = ZoneInfo(TIMEZONE)
+
 app = Flask(__name__)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# --- 2. 網站健康檢查入口 (給 Keep Alive 戳的) ---
 @app.get("/")
 def health():
     return "OK (System is running)"
 
-# --- 3. LINE Webhook 入口 (給 LINE 官方伺服器呼叫) ---
+# --- LINE Webhook ---
 @app.post("/callback")
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -44,55 +50,37 @@ def callback():
         abort(400)
     return "OK"
 
-# --- 4. 排程觸發入口 (給外部 cron-job.org 呼叫) ---
+# --- 排程觸發入口 (給外部 Cron 服務呼叫) ---
 
 @app.get("/tasks/daily-push")
 def trigger_daily_push():
-    """ 觸發每日預約提醒 """
-    # 安全檢查：比對密鑰
     auth_header = request.headers.get("X-Cron-Secret")
     auth_query = request.args.get("key")
-    
     if (auth_header != CRON_SECRET) and (auth_query != CRON_SECRET):
-        return jsonify({"error": "Unauthorized", "message": "密鑰錯誤，拒絕執行"}), 401
-
-    # 執行每日推播邏輯
+        return jsonify({"error": "Unauthorized"}), 401
     try:
-        print("[Task] Starting Daily Push...")
         daily_push.main() 
-        return jsonify({"status": "success", "message": "每日推播執行完畢"}), 200
+        return jsonify({"status": "success"}), 200
     except Exception as e:
-        error_msg = traceback.format_exc()
-        print(f"[Task Error] {error_msg}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.get("/tasks/monthly-stats")
 def trigger_monthly_stats():
-    """ 觸發月度統計 (程式內部會自己判斷是不是1號) """
     auth_header = request.headers.get("X-Cron-Secret")
     auth_query = request.args.get("key")
-
     if (auth_header != CRON_SECRET) and (auth_query != CRON_SECRET):
         return jsonify({"error": "Unauthorized"}), 401
-
     try:
-        print("[Task] Starting Monthly Stats...")
         monthly_stats.main()
-        return jsonify({"status": "success", "message": "月度檢查執行完畢"}), 200
+        return jsonify({"status": "success"}), 200
     except Exception as e:
-        error_msg = traceback.format_exc()
-        print(f"[Task Error] {error_msg}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# --- 5. LINE 事件處理邏輯 ---
+# --- LINE 事件處理 ---
 
 @handler.add(FollowEvent)
 def on_follow(event: FollowEvent):
-    """
-    當使用者【加入好友】時觸發：
-    只負責記錄資料到 Google Sheet，不發送任何回覆訊息。
-    """
     uid = event.source.user_id
     display_name = ""
     try:
@@ -100,8 +88,6 @@ def on_follow(event: FollowEvent):
         display_name = prof.display_name or ""
     except Exception:
         pass
-
-    # 寫進 Google Sheet
     try:
         upsert_patient(display_name, uid)
         print(f"[SHEET UPSERT SUCCESS] {display_name} ({uid})")
@@ -110,29 +96,40 @@ def on_follow(event: FollowEvent):
 
 @handler.add(MessageEvent, message=TextMessage)
 def on_message(event: MessageEvent):
-    """
-    當收到【文字訊息】時觸發：
-    1. 自動補登：如果是舊病人傳訊息，順便把資料存進 Sheet。
-    2. 管理員指令：如果是你傳送 #dev 開頭的訊息，機器人才會回應。
-    """
     uid = event.source.user_id
     text = (event.message.text or "").strip()
 
-    # --- A. 自動補登資料 (針對舊病人) ---
+    # 1. 自動補登資料 (針對舊病人)
     try:
-        # 嘗試取得使用者暱稱
         profile = line_bot_api.get_profile(uid)
         display_name = profile.display_name or "Unknown"
-        # 存入 Sheet (若已存在，這行會自動忽略，不會重複)
         upsert_patient(display_name, uid)
-    except Exception as e:
-        # 補登失敗只印 Log，不影響主要流程
-        print(f"[AUTO SAVE FAIL] {uid}: {e}")
+    except Exception:
+        pass
 
-    # --- B. 管理員測試指令 (#dev) ---
+    # 2. 權限檢查
     is_admin = uid in ADMIN_USER_IDS
-    is_dev = DEV_ONLY_PREFIX and text.startswith(DEV_ONLY_PREFIX)
+    
+    # --- 新增功能：手動查業績 ---
+    # 只有管理員可以查，關鍵字：「查業績」或「業績」
+    if is_admin and text in ["查業績", "業績", "查詢業績"]:
+        try:
+            # 傳送「計算中」的提示，避免等太久以為當機
+            # (但 LINE 回覆 token 只能用一次，所以我們直接讓它等一下下算出結果再回比較簡單)
+            
+            # 呼叫 monthly_stats 算立即的報表
+            report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ))
+            
+            # 回覆訊息
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report_msg))
+            return # 處理完就結束，不往下執行
+        except Exception as e:
+            error_msg = f"查詢失敗：{str(e)}"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
+            return
 
+    # 3. 原本的測試指令 (#dev)
+    is_dev = DEV_ONLY_PREFIX and text.startswith(DEV_ONLY_PREFIX)
     if is_admin and is_dev:
         reply_text = text[len(DEV_ONLY_PREFIX):].strip() or "(空訊息)"
         try:
