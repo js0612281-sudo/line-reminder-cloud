@@ -1,7 +1,7 @@
 # monthly_stats.py
 # 修改紀錄：
-# 1. 將「產生報表文字」的邏輯拆解成 get_stats_report_text()，方便 app.py 隨時呼叫。
-# 2. main() 仍保留「倒數第二天」自動推播的功能。
+# 1. 支援查詢他人業績：新增 title_prefix 參數，可依據標題開頭 (例如 "8" 或 "8外") 來篩選行程。
+# 2. 保留原有的 filter_by_me 邏輯，如果沒給代號，就用 Email 算自己的。
 
 from __future__ import annotations
 import os
@@ -75,7 +75,11 @@ def _iso(dt: datetime) -> str:
         raise ValueError("datetime must be tz-aware")
     return dt.isoformat()
 
-def fetch_my_events_in_range(start: datetime, end: datetime) -> List[Dict]:
+def fetch_events_in_range(start: datetime, end: datetime, filter_by_me: bool = True, title_prefix: str = None) -> List[Dict]:
+    """
+    如果 title_prefix 有值 (例如 "8")，就抓取標題開頭為該字串的行程 (不看 email)。
+    否則，依照 filter_by_me 判斷是否只抓取屬於 MY_EMAIL 的行程。
+    """
     svc = _cal_service()
     results: List[Dict] = []
     time_min = _iso(start)
@@ -93,20 +97,29 @@ def fetch_my_events_in_range(start: datetime, end: datetime) -> List[Dict]:
             for ev in resp.get("items", []):
                 if ev.get("status") == "cancelled": continue
                 
-                creator = (ev.get("creator") or {}).get("email", "").lower()
-                organizer = (ev.get("organizer") or {}).get("email", "").lower()
-                attendees = ev.get("attendees") or []
-                me = (MY_EMAIL or "").lower()
-                
-                is_mine = False
-                if me:
-                    if creator == me or organizer == me: is_mine = True
-                    elif any((a.get("email") or "").lower() == me and a.get("responseStatus") != "declined" for a in attendees):
-                        is_mine = True
-                if not is_mine: continue
+                summary = ev.get("summary", "") or ""
+
+                # --- 篩選邏輯 ---
+                if title_prefix:
+                    # 模式 A：查特定代號 (只要標題開頭符合，例如 "8" 外，就抓進來)
+                    if not summary.startswith(title_prefix):
+                        continue
+                elif filter_by_me:
+                    # 模式 B：查自己 (用 Email 判斷)
+                    creator = (ev.get("creator") or {}).get("email", "").lower()
+                    organizer = (ev.get("organizer") or {}).get("email", "").lower()
+                    attendees = ev.get("attendees") or []
+                    me = (MY_EMAIL or "").lower()
+                    
+                    is_mine = False
+                    if me:
+                        if creator == me or organizer == me: is_mine = True
+                        elif any((a.get("email") or "").lower() == me and a.get("responseStatus") != "declined" for a in attendees):
+                            is_mine = True
+                    if not is_mine: continue
                 
                 results.append({
-                    "summary": ev.get("summary", "") or "",
+                    "summary": summary,
                     "start": ev.get("start", {}),
                     "end": ev.get("end", {}),
                     "location": ev.get("location", "") or "",
@@ -150,17 +163,21 @@ def summarize_month(events: List[Dict]) -> Tuple[int, int, int]:
     return one_h, half_h, min45
 
 # ======== 新增：產生報表文字的核心函式 (給 app.py 呼叫用) ========
-def get_stats_report_text(target_date: datetime) -> str:
-    """計算指定日期所在月份的完整業績，回傳文字報表"""
-    # 計算範圍：月初 ~ 下月初 (完整包含本月)
+def get_stats_report_text(target_date: datetime, title_prefix: str = None) -> str:
+    """計算指定日期所在月份的完整業績，支援用標題前綴搜尋"""
     start, end = get_full_month_range(target_date)
     
-    events = fetch_my_events_in_range(start, end)
+    # 呼叫抓取函式
+    events = fetch_events_in_range(start, end, filter_by_me=(not bool(title_prefix)), title_prefix=title_prefix)
     one_h, half_h, min45 = summarize_month(events)
 
     month_str = str(start.month)
+    
+    # 動態產生報表標題 (區分是你自己的還是某個代號的)
+    header_name = f" [{title_prefix}]" if title_prefix else " (自己)"
+    
     msg = (
-        f"📊【{month_str}月 即時統計】\n"
+        f"📊【{month_str}月 即時統計】{header_name}\n"
         f"(含本月所有已安排行程)\n"
         f"------------------\n"
         f"一小時：{one_h}\n"
@@ -173,14 +190,11 @@ def get_stats_report_text(target_date: datetime) -> str:
 def main():
     now = datetime.now(TZ)
     
-    # 1. 自動檢查：如果不是倒數第二天，就安靜結束
     if not is_second_to_last_day(now):
         print(f"[INFO] Today is {now.date()}, not the second to last day. Skip.")
         return
 
     print("[INFO] Target day matched! Pushing monthly stats...")
-    
-    # 2. 呼叫核心函式取得報表
     msg = get_stats_report_text(now)
 
     if not ADMIN_USER_IDS:
