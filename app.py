@@ -1,5 +1,5 @@
 # app.py - Flask LINE webhook (Render) + Task Triggers
-# 修改紀錄：新增「查業績」指令，手動觸發月報表回覆
+# 修改紀錄：升級「查業績」指令，支援輸入特定代號查詢其他治療師業績
 
 import os
 import traceback
@@ -13,7 +13,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEve
 # 匯入工具
 from sheets_utils import upsert_patient
 import daily_push
-import monthly_stats  # 匯入剛改好的統計模組
+import monthly_stats  
 
 # --- 必填環境變數 ---
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "").strip()
@@ -27,7 +27,6 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 DEV_ONLY_PREFIX = os.getenv("DEV_ONLY_PREFIX", "#dev")
 ADMIN_USER_IDS = {u.strip() for u in os.getenv("ADMIN_USER_IDS", "").split(",") if u.strip()}
 
-# 時區設定 (給手動查詢用)
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei").strip()
 TZ = ZoneInfo(TIMEZONE)
 
@@ -50,8 +49,7 @@ def callback():
         abort(400)
     return "OK"
 
-# --- 排程觸發入口 (給外部 Cron 服務呼叫) ---
-
+# --- 排程觸發入口 ---
 @app.get("/tasks/daily-push")
 def trigger_daily_push():
     auth_header = request.headers.get("X-Cron-Secret")
@@ -76,9 +74,7 @@ def trigger_monthly_stats():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 # --- LINE 事件處理 ---
-
 @handler.add(FollowEvent)
 def on_follow(event: FollowEvent):
     uid = event.source.user_id
@@ -90,7 +86,6 @@ def on_follow(event: FollowEvent):
         pass
     try:
         upsert_patient(display_name, uid)
-        print(f"[SHEET UPSERT SUCCESS] {display_name} ({uid})")
     except Exception as e:
         print(f"[SHEET UPSERT FAIL] {uid}: {e}")
 
@@ -99,7 +94,7 @@ def on_message(event: MessageEvent):
     uid = event.source.user_id
     text = (event.message.text or "").strip()
 
-    # 1. 自動補登資料 (針對舊病人)
+    # 1. 自動補登資料
     try:
         profile = line_bot_api.get_profile(uid)
         display_name = profile.display_name or "Unknown"
@@ -110,19 +105,21 @@ def on_message(event: MessageEvent):
     # 2. 權限檢查
     is_admin = uid in ADMIN_USER_IDS
     
-    # --- 新增功能：手動查業績 ---
-    # 只有管理員可以查，關鍵字：「查業績」或「業績」
-    if is_admin and text in ["查業績", "業績", "查詢業績"]:
+    # --- 升級功能：手動查業績 (支援查代號) ---
+    if is_admin and (text.startswith("查業績") or text.startswith("業績")):
         try:
-            # 傳送「計算中」的提示，避免等太久以為當機
-            # (但 LINE 回覆 token 只能用一次，所以我們直接讓它等一下下算出結果再回比較簡單)
+            # 解析使用者有沒有輸入代號 (例如把 "查業績 8" 變成 "8")
+            target_prefix = text.replace("查業績", "").replace("業績", "").strip()
             
-            # 呼叫 monthly_stats 算立即的報表
-            report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ))
+            if target_prefix:
+                # 查特定代號 (例如 "8" 或 "8外")
+                report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ), title_prefix=target_prefix)
+            else:
+                # 沒加代號，維持查自己 (用 Email)
+                report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ))
             
-            # 回覆訊息
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report_msg))
-            return # 處理完就結束，不往下執行
+            return 
         except Exception as e:
             error_msg = f"查詢失敗：{str(e)}"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
@@ -135,7 +132,7 @@ def on_message(event: MessageEvent):
         try:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         except Exception as e:
-            print(f"[ADMIN REPLY FAIL] {uid}: {e}")
+            pass
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
