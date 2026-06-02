@@ -1,9 +1,9 @@
 # app.py - Flask LINE webhook (Render) + Task Triggers
-# 修改紀錄：加入「查總業績」指令
+# 修改紀錄：加入「查詢上個月」時間轉換邏輯
 
 import os
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, abort, jsonify
 from linebot import LineBotApi, WebhookHandler
@@ -77,15 +77,11 @@ def trigger_monthly_stats():
 @handler.add(FollowEvent)
 def on_follow(event: FollowEvent):
     uid = event.source.user_id
-    display_name = ""
     try:
         prof = line_bot_api.get_profile(uid)
         display_name = prof.display_name or ""
-    except Exception:
-        pass
-    try:
         upsert_patient(display_name, uid)
-    except Exception as e:
+    except Exception:
         pass
 
 @handler.add(MessageEvent, message=TextMessage)
@@ -106,10 +102,21 @@ def on_message(event: MessageEvent):
     
     # --- 升級功能：業績查詢區 ---
     if is_admin:
+        # 決定要查「這個月」還是「上個月」
+        now = datetime.now(TZ)
+        target_date = now
+        
+        # 關鍵邏輯：如果是查上個月，就把目標時間扣到上個月，並把指令清洗乾淨
+        if "上個月" in text or "上月" in text:
+            # 本月 1 號減一天，就會是上個月的最後一天
+            target_date = now.replace(day=1) - timedelta(days=1)
+            # 清洗字眼，例如把 "查上個月業績 8" 變成 "查業績 8"
+            text = text.replace("上個月", "").replace("上月", "").strip()
+
         # A. 查詢所有人總表
         if text in ["查總業績", "總業績", "查所有人", "所有人業績"]:
             try:
-                report_msg = monthly_stats.get_all_stats_report_text(datetime.now(TZ))
+                report_msg = monthly_stats.get_all_stats_report_text(target_date)
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report_msg))
             except Exception as e:
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"查詢失敗：{str(e)}"))
@@ -120,9 +127,9 @@ def on_message(event: MessageEvent):
             try:
                 target_prefix = text.replace("查業績", "").replace("業績", "").strip()
                 if target_prefix:
-                    report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ), title_prefix=target_prefix)
+                    report_msg = monthly_stats.get_stats_report_text(target_date, title_prefix=target_prefix)
                 else:
-                    report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ))
+                    report_msg = monthly_stats.get_stats_report_text(target_date)
                 
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report_msg))
             except Exception as e:
