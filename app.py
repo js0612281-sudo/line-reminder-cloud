@@ -1,5 +1,5 @@
 # app.py - Flask LINE webhook (Render) + Task Triggers
-# 修改紀錄：升級「查業績」指令，支援輸入特定代號查詢其他治療師業績
+# 修改紀錄：加入「查總業績」指令
 
 import os
 import traceback
@@ -23,7 +23,6 @@ CRON_SECRET = os.getenv("CRON_SECRET", "my-secret-key")
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
     raise ValueError("缺少 CHANNEL_SECRET 或 CHANNEL_ACCESS_TOKEN")
 
-# 管理者設定
 DEV_ONLY_PREFIX = os.getenv("DEV_ONLY_PREFIX", "#dev")
 ADMIN_USER_IDS = {u.strip() for u in os.getenv("ADMIN_USER_IDS", "").split(",") if u.strip()}
 
@@ -87,7 +86,7 @@ def on_follow(event: FollowEvent):
     try:
         upsert_patient(display_name, uid)
     except Exception as e:
-        print(f"[SHEET UPSERT FAIL] {uid}: {e}")
+        pass
 
 @handler.add(MessageEvent, message=TextMessage)
 def on_message(event: MessageEvent):
@@ -105,33 +104,38 @@ def on_message(event: MessageEvent):
     # 2. 權限檢查
     is_admin = uid in ADMIN_USER_IDS
     
-    # --- 升級功能：手動查業績 (支援查代號) ---
-    if is_admin and (text.startswith("查業績") or text.startswith("業績")):
-        try:
-            # 解析使用者有沒有輸入代號 (例如把 "查業績 8" 變成 "8")
-            target_prefix = text.replace("查業績", "").replace("業績", "").strip()
+    # --- 升級功能：業績查詢區 ---
+    if is_admin:
+        # A. 查詢所有人總表
+        if text in ["查總業績", "總業績", "查所有人", "所有人業績"]:
+            try:
+                report_msg = monthly_stats.get_all_stats_report_text(datetime.now(TZ))
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report_msg))
+            except Exception as e:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"查詢失敗：{str(e)}"))
+            return
             
-            if target_prefix:
-                # 查特定代號 (例如 "8" 或 "8外")
-                report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ), title_prefix=target_prefix)
-            else:
-                # 沒加代號，維持查自己 (用 Email)
-                report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ))
-            
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report_msg))
-            return 
-        except Exception as e:
-            error_msg = f"查詢失敗：{str(e)}"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
+        # B. 查詢單一/自己業績 (支援查代號)
+        elif text.startswith("查業績") or text.startswith("業績"):
+            try:
+                target_prefix = text.replace("查業績", "").replace("業績", "").strip()
+                if target_prefix:
+                    report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ), title_prefix=target_prefix)
+                else:
+                    report_msg = monthly_stats.get_stats_report_text(datetime.now(TZ))
+                
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report_msg))
+            except Exception as e:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"查詢失敗：{str(e)}"))
             return
 
-    # 3. 原本的測試指令 (#dev)
+    # 3. 測試指令
     is_dev = DEV_ONLY_PREFIX and text.startswith(DEV_ONLY_PREFIX)
     if is_admin and is_dev:
         reply_text = text[len(DEV_ONLY_PREFIX):].strip() or "(空訊息)"
         try:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-        except Exception as e:
+        except Exception:
             pass
 
 if __name__ == "__main__":
