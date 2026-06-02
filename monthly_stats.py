@@ -1,7 +1,7 @@
 # monthly_stats.py
 # 修改紀錄：
-# 1. 支援查詢他人業績：新增 title_prefix 參數，可依據標題開頭 (例如 "8" 或 "8外") 來篩選行程。
-# 2. 保留原有的 filter_by_me 邏輯，如果沒給代號，就用 Email 算自己的。
+# 1. 新增「15分鐘」獨立統計欄位。
+# 2. 新增 get_all_stats_report_text()，用以一次性列出所有代號(減號前方字串)的業績總表。
 
 from __future__ import annotations
 import os
@@ -55,7 +55,6 @@ def _cal_service():
 # ======== 日期計算邏輯 ========
 
 def get_full_month_range(now: datetime) -> Tuple[datetime, datetime]:
-    """回傳『當月 1 號 00:00』到『下個月 1 號 00:00』(完整包含本月)"""
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     days_in_month = calendar.monthrange(now.year, now.month)[1]
     last_day_date = now.replace(day=days_in_month)
@@ -76,10 +75,6 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 def fetch_events_in_range(start: datetime, end: datetime, filter_by_me: bool = True, title_prefix: str = None) -> List[Dict]:
-    """
-    如果 title_prefix 有值 (例如 "8")，就抓取標題開頭為該字串的行程 (不看 email)。
-    否則，依照 filter_by_me 判斷是否只抓取屬於 MY_EMAIL 的行程。
-    """
     svc = _cal_service()
     results: List[Dict] = []
     time_min = _iso(start)
@@ -99,13 +94,10 @@ def fetch_events_in_range(start: datetime, end: datetime, filter_by_me: bool = T
                 
                 summary = ev.get("summary", "") or ""
 
-                # --- 篩選邏輯 ---
                 if title_prefix:
-                    # 模式 A：查特定代號 (只要標題開頭符合，例如 "8" 外，就抓進來)
                     if not summary.startswith(title_prefix):
                         continue
                 elif filter_by_me:
-                    # 模式 B：查自己 (用 Email 判斷)
                     creator = (ev.get("creator") or {}).get("email", "").lower()
                     organizer = (ev.get("organizer") or {}).get("email", "").lower()
                     attendees = ev.get("attendees") or []
@@ -129,12 +121,17 @@ def fetch_events_in_range(start: datetime, end: datetime, filter_by_me: bool = T
             if not page_token: break
     return results
 
+# 新增 15min 的正則表達式
+RE_15 = re.compile(r"(15\s*(?:min|分鐘|分)?)", re.IGNORECASE)
 RE_45 = re.compile(r"(45\s*(?:min|分鐘|分)?)", re.IGNORECASE)
 RE_MULTI = re.compile(r"(\d)(?:\s*\+\s*(\d))+")
 
-def count_session_from_title(title: str) -> Tuple[int, int, int]:
+def count_session_from_title(title: str) -> Tuple[int, int, int, int]:
+    """回傳格式：(一小時, 半小時, 45分鐘, 15分鐘)"""
     t = (title or "").strip()
-    if RE_45.search(t): return (0, 0, 1)
+    
+    if RE_15.search(t): return (0, 0, 0, 1)
+    if RE_45.search(t): return (0, 0, 1, 0)
     
     m_multi = RE_MULTI.search(t)
     if m_multi:
@@ -143,37 +140,32 @@ def count_session_from_title(title: str) -> Tuple[int, int, int]:
         for n in nums:
             if n == 2: hours += 1
             elif n == 1: halves += 1
-        return (hours, halves, 0)
+        return (hours, halves, 0, 0)
 
     m_end = re.search(r"(\d)\s*(?:\(.*\)|（.*）)?\s*$", t)
     if m_end:
         n = int(m_end.group(1))
-        if n == 2: return (1, 0, 0)
-        elif n == 1: return (0, 1, 0)
+        if n == 2: return (1, 0, 0, 0)
+        elif n == 1: return (0, 1, 0, 0)
     
-    return (0, 1, 0)
+    return (0, 1, 0, 0)
 
-def summarize_month(events: List[Dict]) -> Tuple[int, int, int]:
-    one_h = half_h = min45 = 0
+def summarize_month(events: List[Dict]) -> Tuple[int, int, int, int]:
+    one_h = half_h = min45 = min15 = 0
     for ev in events:
         title = ev.get("summary", "")
         if "-" not in title: continue
-        a, b, c = count_session_from_title(title)
-        one_h += a; half_h += b; min45 += c
-    return one_h, half_h, min45
+        a, b, c, d = count_session_from_title(title)
+        one_h += a; half_h += b; min45 += c; min15 += d
+    return one_h, half_h, min45, min15
 
-# ======== 新增：產生報表文字的核心函式 (給 app.py 呼叫用) ========
+# ======== 單一治療師報表 ========
 def get_stats_report_text(target_date: datetime, title_prefix: str = None) -> str:
-    """計算指定日期所在月份的完整業績，支援用標題前綴搜尋"""
     start, end = get_full_month_range(target_date)
-    
-    # 呼叫抓取函式
     events = fetch_events_in_range(start, end, filter_by_me=(not bool(title_prefix)), title_prefix=title_prefix)
-    one_h, half_h, min45 = summarize_month(events)
+    one_h, half_h, min45, min15 = summarize_month(events)
 
     month_str = str(start.month)
-    
-    # 動態產生報表標題 (區分是你自己的還是某個代號的)
     header_name = f" [{title_prefix}]" if title_prefix else " (自己)"
     
     msg = (
@@ -182,24 +174,67 @@ def get_stats_report_text(target_date: datetime, title_prefix: str = None) -> st
         f"------------------\n"
         f"一小時：{one_h}\n"
         f"半小時：{half_h}\n"
-        f"45分鐘：{min45}"
+        f"45分鐘：{min45}\n"
+        f"15分鐘：{min15}"
     )
     return msg
+
+# ======== 新增：所有人總業績報表 ========
+def get_all_stats_report_text(target_date: datetime) -> str:
+    """自動抓取所有有 '-' 的行程，並以減號前面的字串做分類加總"""
+    start, end = get_full_month_range(target_date)
+    # filter_by_me=False 且 title_prefix=None 代表抓取該日曆上所有人的所有行程
+    events = fetch_events_in_range(start, end, filter_by_me=False, title_prefix=None)
+    
+    # 用字典來儲存每個代號的成績： {"8外": [1hr, 0.5hr, 45m, 15m], "2": [...]}
+    stats_map = {}
+    
+    for ev in events:
+        title = ev.get("summary", "")
+        if "-" not in title: continue
+        
+        # 取得減號前面的代號，去除空白
+        prefix = title.split("-")[0].strip()
+        if not prefix: continue
+        
+        a, b, c, d = count_session_from_title(title)
+        
+        if prefix not in stats_map:
+            stats_map[prefix] = [0, 0, 0, 0]
+            
+        stats_map[prefix][0] += a
+        stats_map[prefix][1] += b
+        stats_map[prefix][2] += c
+        stats_map[prefix][3] += d
+
+    month_str = str(start.month)
+    lines = [
+        f"📊【{month_str}月 所有人總業績】",
+        f"(含本月所有已安排行程)",
+        f"------------------"
+    ]
+    
+    if not stats_map:
+        lines.append("目前沒有找到任何包含 '-' 的業績資料。")
+    else:
+        # 將代號依字母/數字排序，讓版面更整齊
+        for prefix in sorted(stats_map.keys()):
+            v = stats_map[prefix]
+            lines.append(f"👤 [{prefix}]")
+            # 為了手機排版好看，縮寫成一行
+            lines.append(f"1h:{v[0]} | 0.5h:{v[1]} | 45m:{v[2]} | 15m:{v[3]}")
+            lines.append("") # 空行分隔
+            
+    return "\n".join(lines).strip()
 
 # ======== 主流程 (Cron Job 呼叫用) ========
 def main():
     now = datetime.now(TZ)
-    
     if not is_second_to_last_day(now):
-        print(f"[INFO] Today is {now.date()}, not the second to last day. Skip.")
         return
-
-    print("[INFO] Target day matched! Pushing monthly stats...")
     msg = get_stats_report_text(now)
-
     if not ADMIN_USER_IDS:
         return
-
     for uid in ADMIN_USER_IDS:
         try:
             line_bot_api.push_message(uid, TextSendMessage(text=msg))
