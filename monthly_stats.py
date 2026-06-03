@@ -1,7 +1,7 @@
 # monthly_stats.py
 # 修改紀錄：
-# 1. 新增各職級 (班內/班外) 薪水費率。
-# 2. 總業績報表自動結算預估薪水 (自動排除皮拉提斯與側彎項目)。
+# 1. 加入「防禦表情符號」邏輯：利用正則表達式只擷取減號前方的「純數字」作為對應依據。
+# 2. 自動忽略標題前綴的圖示、空白與中文字 (如 "外", "內")，大幅提高容錯率。
 
 from __future__ import annotations
 import os
@@ -95,7 +95,22 @@ def fetch_events_in_range(start: datetime, end: datetime, filter_by_me: bool = T
                 summary = ev.get("summary", "") or ""
 
                 if title_prefix:
-                    if not summary.startswith(title_prefix):
+                    # 【免疫表情符號篩選邏輯】
+                    if "-" not in summary:
+                        continue
+                        
+                    # 從行事曆減號前，只抓取「數字」
+                    event_prefix_raw = summary.split("-")[0]
+                    m_event = re.search(r'\d+', event_prefix_raw)
+                    if not m_event:
+                        continue
+                    event_code = m_event.group(0)
+
+                    # 把使用者輸入的查詢字眼 (例如 "8外" 或 "8") 也轉換成純數字
+                    m_target = re.search(r'\d+', title_prefix)
+                    target_code = m_target.group(0) if m_target else title_prefix
+
+                    if event_code != target_code:
                         continue
                 elif filter_by_me:
                     creator = (ev.get("creator") or {}).get("email", "").lower()
@@ -162,7 +177,7 @@ def _get_subtitle(target_date: datetime) -> str:
         return "(含本月所有已安排行程)"
     return "(該月完整業績)"
 
-# ======== 單一治療師報表 (維持原本的查詢功能) ========
+# ======== 單一治療師報表 ========
 def get_stats_report_text(target_date: datetime, title_prefix: str = None) -> str:
     start, end = get_full_month_range(target_date)
     events = fetch_events_in_range(start, end, filter_by_me=(not bool(title_prefix)), title_prefix=title_prefix)
@@ -188,7 +203,7 @@ def get_all_stats_report_text(target_date: datetime) -> str:
     start, end = get_full_month_range(target_date)
     events = fetch_events_in_range(start, end, filter_by_me=False, title_prefix=None)
     
-    # 【治療師代號對照表】
+    # 【治療師代號對照表】(現在都改用純數字對應了！)
     PREFIX_MAP = {
         "5": ("品萱", "5", "班內"),
         "6": ("品萱", "6", "班外"),
@@ -200,7 +215,6 @@ def get_all_stats_report_text(target_date: datetime) -> str:
         "2": ("逸瑄", "2", "班外"),
         "7": ("家森", "7", "班內"),
         "8": ("家森", "8", "班外"),
-        "8外": ("家森", "8", "班外"),
         "25": ("品君", "25", "班內"),
         "26": ("品君", "26", "班外"),
     }
@@ -213,17 +227,21 @@ def get_all_stats_report_text(target_date: datetime) -> str:
     
     THERAPIST_ORDER = ["品萱", "恆宇", "玹助", "逸瑄", "家森", "品君", "其他"]
     
-    # 紀錄人次
     stats_map = {name: {} for name in THERAPIST_ORDER}
-    # 紀錄薪水總額
     salary_map = {name: 0 for name in THERAPIST_ORDER}
     
     for ev in events:
         title = ev.get("summary", "")
         if "-" not in title: continue
         
-        prefix = title.split("-")[0].strip()
-        if not prefix: continue
+        # 1. 取出減號前方的字串
+        prefix_raw = title.split("-")[0].strip()
+        
+        # 2. 只要裡面的純數字！(免疫所有表情符號和 "外/內" 等中文字)
+        m_prefix = re.search(r'\d+', prefix_raw)
+        if not m_prefix: 
+            continue # 如果沒有數字 (例如只有圖案)，就不處理
+        prefix = m_prefix.group(0) # 得到 "5", "8", "21" 等
         
         a, b, c, d = count_session_from_title(title)
         
@@ -248,7 +266,6 @@ def get_all_stats_report_text(target_date: datetime) -> str:
                 k = f"{base_code} {shift_name}{duration_name}{tag}" if shift_name else f"{base_code} {duration_name}{tag}"
                 stats_map[t_name][k] = stats_map[t_name].get(k, 0) + count
                 
-                # 計算薪水：沒有特定標籤(非皮拉提斯/側彎)，且明確區分班內外的才算錢
                 if tag == "" and shift_name in SALARY_RATES:
                     salary_map[t_name] += (SALARY_RATES[shift_name][duration_name] * count)
 
@@ -288,7 +305,6 @@ def get_all_stats_report_text(target_date: datetime) -> str:
         for k in sorted(t_stats.keys(), key=sort_key):
             lines.append(f"{k}：{t_stats[k]}")
             
-        # 在每位治療師的明細下方印出結算薪資
         total_salary = salary_map[t_name]
         if total_salary > 0:
             lines.append(f"💰 預估薪水：{total_salary:,} 元")
