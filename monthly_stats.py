@@ -1,5 +1,8 @@
 # monthly_stats.py
-# 修改紀錄：優化報表文字，支援自動判斷是「當月」還是「歷史」月份的文字顯示
+# 修改紀錄：
+# 1. 總表全面升級為「專屬治療師版型」，自動將代號轉換為「班內/班外」。
+# 2. 自動過濾數量為 0 的項目。
+# 3. 支援辨識「皮拉提斯」(標題含"皮拉") 及「側彎」(標題含"側彎") 並獨立計算。
 
 from __future__ import annotations
 import os
@@ -160,7 +163,7 @@ def _get_subtitle(target_date: datetime) -> str:
         return "(含本月所有已安排行程)"
     return "(該月完整業績)"
 
-# ======== 單一治療師報表 ========
+# ======== 單一治療師報表 (維持原本的查詢功能) ========
 def get_stats_report_text(target_date: datetime, title_prefix: str = None) -> str:
     start, end = get_full_month_range(target_date)
     events = fetch_events_in_range(start, end, filter_by_me=(not bool(title_prefix)), title_prefix=title_prefix)
@@ -181,42 +184,108 @@ def get_stats_report_text(target_date: datetime, title_prefix: str = None) -> st
     )
     return msg
 
-# ======== 新增：所有人總業績報表 ========
+# ======== 新增：所有人總業績報表 (客製化版型) ========
 def get_all_stats_report_text(target_date: datetime) -> str:
     start, end = get_full_month_range(target_date)
     events = fetch_events_in_range(start, end, filter_by_me=False, title_prefix=None)
     
-    stats_map = {}
+    # 【治療師代號對照表】(未來有新人直接加在這裡即可)
+    PREFIX_MAP = {
+        "5": ("品萱", "5", "班內"),
+        "6": ("品萱", "6", "班外"),
+        "20": ("恆宇", "20", "班內"),
+        "21": ("恆宇", "21", "班外"),
+        "3": ("玹助", "3", "班內"),
+        "4": ("玹助", "4", "班外"),
+        "1": ("逸瑄", "1", "班內"),
+        "2": ("逸瑄", "2", "班外"),
+        "7": ("家森", "7", "班內"),
+        "8": ("家森", "8", "班外"),
+        "8外": ("家森", "8", "班外"), # 預防有人習慣打 8外
+        "25": ("品君", "25", "班內"),
+        "26": ("品君", "26", "班外"),
+    }
+    
+    # 決定版面顯示的治療師順序
+    THERAPIST_ORDER = ["品萱", "恆宇", "玹助", "逸瑄", "家森", "品君", "其他"]
+    
+    stats_map = {name: {} for name in THERAPIST_ORDER}
+    
     for ev in events:
         title = ev.get("summary", "")
         if "-" not in title: continue
+        
         prefix = title.split("-")[0].strip()
         if not prefix: continue
+        
         a, b, c, d = count_session_from_title(title)
-        if prefix not in stats_map:
-            stats_map[prefix] = [0, 0, 0, 0]
-        stats_map[prefix][0] += a
-        stats_map[prefix][1] += b
-        stats_map[prefix][2] += c
-        stats_map[prefix][3] += d
+        
+        # 如果是 0，就完全不用往下處理了
+        if a == 0 and b == 0 and c == 0 and d == 0:
+            continue
+            
+        # 尋找特殊標籤
+        tag = ""
+        if "皮拉" in title:
+            tag = "（皮拉提斯）"
+        elif "側彎" in title:
+            tag = "（側彎）"
+            
+        # 轉換代號為治療師名字
+        if prefix in PREFIX_MAP:
+            t_name, base_code, shift_name = PREFIX_MAP[prefix]
+        else:
+            t_name = "其他"
+            base_code = prefix
+            shift_name = ""
+            
+        # 累加進特定項目的計數器中
+        def add_count(duration_name, count):
+            if count > 0:
+                # 組合文字，例如："6 班外一小時（皮拉提斯）"
+                k = f"{base_code} {shift_name}{duration_name}{tag}" if shift_name else f"{base_code} {duration_name}{tag}"
+                stats_map[t_name][k] = stats_map[t_name].get(k, 0) + count
+
+        add_count("一小時", a)
+        add_count("半小時", b)
+        add_count("45分鐘", c)
+        add_count("15分鐘", d)
 
     month_str = str(start.month)
-    sub_title = _get_subtitle(target_date)
-    lines = [
-        f"📊【{month_str}月 所有人總業績】",
-        f"{sub_title}",
-        f"------------------"
-    ]
+    lines = [f"{month_str}月自費總統計："]
     
-    if not stats_map:
-        lines.append("目前沒有找到任何包含 '-' 的業績資料。")
-    else:
-        for prefix in sorted(stats_map.keys()):
-            v = stats_map[prefix]
-            lines.append(f"👤 [{prefix}]")
-            lines.append(f"1h:{v[0]} | 0.5h:{v[1]} | 45m:{v[2]} | 15m:{v[3]}")
-            lines.append("")
+    # 用來排序輸出的項目 (班內放前面，時間長的放前面)
+    def sort_key(k):
+        parts = k.split(" ", 1)
+        base_code = int(parts[0]) if parts[0].isdigit() else 999
+        
+        dur_score = 0
+        if "半小時" in k: dur_score = 1
+        elif "一小時" in k: dur_score = 2
+        elif "45分鐘" in k: dur_score = 3
+        elif "15分鐘" in k: dur_score = 4
+        
+        tag_score = 0
+        if "皮拉" in k: tag_score = 1
+        elif "側彎" in k: tag_score = 2
+        
+        return (base_code, dur_score, tag_score)
+        
+    has_data = False
+    for t_name in THERAPIST_ORDER:
+        t_stats = stats_map[t_name]
+        if not t_stats: continue # 如果這個治療師本月沒有任何大於 0 的紀錄，就不會顯示他的名字
+        
+        has_data = True
+        lines.append("")
+        lines.append(t_name)
+        
+        for k in sorted(t_stats.keys(), key=sort_key):
+            lines.append(f"{k}：{t_stats[k]}")
             
+    if not has_data:
+        lines.append("目前沒有找到任何業績資料。")
+        
     return "\n".join(lines).strip()
 
 # ======== 主流程 (Cron Job 呼叫用) ========
