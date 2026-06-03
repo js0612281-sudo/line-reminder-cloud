@@ -1,8 +1,7 @@
 # monthly_stats.py
 # 修改紀錄：
-# 1. 總表全面升級為「專屬治療師版型」，自動將代號轉換為「班內/班外」。
-# 2. 自動過濾數量為 0 的項目。
-# 3. 支援辨識「皮拉提斯」(標題含"皮拉") 及「側彎」(標題含"側彎") 並獨立計算。
+# 1. 新增各職級 (班內/班外) 薪水費率。
+# 2. 總業績報表自動結算預估薪水 (自動排除皮拉提斯與側彎項目)。
 
 from __future__ import annotations
 import os
@@ -184,12 +183,12 @@ def get_stats_report_text(target_date: datetime, title_prefix: str = None) -> st
     )
     return msg
 
-# ======== 新增：所有人總業績報表 (客製化版型) ========
+# ======== 新增：所有人總業績報表 (客製化版型 + 自動算薪水) ========
 def get_all_stats_report_text(target_date: datetime) -> str:
     start, end = get_full_month_range(target_date)
     events = fetch_events_in_range(start, end, filter_by_me=False, title_prefix=None)
     
-    # 【治療師代號對照表】(未來有新人直接加在這裡即可)
+    # 【治療師代號對照表】
     PREFIX_MAP = {
         "5": ("品萱", "5", "班內"),
         "6": ("品萱", "6", "班外"),
@@ -201,15 +200,23 @@ def get_all_stats_report_text(target_date: datetime) -> str:
         "2": ("逸瑄", "2", "班外"),
         "7": ("家森", "7", "班內"),
         "8": ("家森", "8", "班外"),
-        "8外": ("家森", "8", "班外"), # 預防有人習慣打 8外
+        "8外": ("家森", "8", "班外"),
         "25": ("品君", "25", "班內"),
         "26": ("品君", "26", "班外"),
     }
     
-    # 決定版面顯示的治療師順序
+    # 【薪資計算費率】
+    SALARY_RATES = {
+        "班內": {"一小時": 880, "半小時": 480, "45分鐘": 760, "15分鐘": 280},
+        "班外": {"一小時": 1320, "半小時": 720, "45分鐘": 1140, "15分鐘": 420}
+    }
+    
     THERAPIST_ORDER = ["品萱", "恆宇", "玹助", "逸瑄", "家森", "品君", "其他"]
     
+    # 紀錄人次
     stats_map = {name: {} for name in THERAPIST_ORDER}
+    # 紀錄薪水總額
+    salary_map = {name: 0 for name in THERAPIST_ORDER}
     
     for ev in events:
         title = ev.get("summary", "")
@@ -220,18 +227,15 @@ def get_all_stats_report_text(target_date: datetime) -> str:
         
         a, b, c, d = count_session_from_title(title)
         
-        # 如果是 0，就完全不用往下處理了
         if a == 0 and b == 0 and c == 0 and d == 0:
             continue
             
-        # 尋找特殊標籤
         tag = ""
         if "皮拉" in title:
             tag = "（皮拉提斯）"
         elif "側彎" in title:
             tag = "（側彎）"
             
-        # 轉換代號為治療師名字
         if prefix in PREFIX_MAP:
             t_name, base_code, shift_name = PREFIX_MAP[prefix]
         else:
@@ -239,12 +243,14 @@ def get_all_stats_report_text(target_date: datetime) -> str:
             base_code = prefix
             shift_name = ""
             
-        # 累加進特定項目的計數器中
         def add_count(duration_name, count):
             if count > 0:
-                # 組合文字，例如："6 班外一小時（皮拉提斯）"
                 k = f"{base_code} {shift_name}{duration_name}{tag}" if shift_name else f"{base_code} {duration_name}{tag}"
                 stats_map[t_name][k] = stats_map[t_name].get(k, 0) + count
+                
+                # 計算薪水：沒有特定標籤(非皮拉提斯/側彎)，且明確區分班內外的才算錢
+                if tag == "" and shift_name in SALARY_RATES:
+                    salary_map[t_name] += (SALARY_RATES[shift_name][duration_name] * count)
 
         add_count("一小時", a)
         add_count("半小時", b)
@@ -254,7 +260,6 @@ def get_all_stats_report_text(target_date: datetime) -> str:
     month_str = str(start.month)
     lines = [f"{month_str}月自費總統計："]
     
-    # 用來排序輸出的項目 (班內放前面，時間長的放前面)
     def sort_key(k):
         parts = k.split(" ", 1)
         base_code = int(parts[0]) if parts[0].isdigit() else 999
@@ -274,7 +279,7 @@ def get_all_stats_report_text(target_date: datetime) -> str:
     has_data = False
     for t_name in THERAPIST_ORDER:
         t_stats = stats_map[t_name]
-        if not t_stats: continue # 如果這個治療師本月沒有任何大於 0 的紀錄，就不會顯示他的名字
+        if not t_stats: continue 
         
         has_data = True
         lines.append("")
@@ -282,6 +287,11 @@ def get_all_stats_report_text(target_date: datetime) -> str:
         
         for k in sorted(t_stats.keys(), key=sort_key):
             lines.append(f"{k}：{t_stats[k]}")
+            
+        # 在每位治療師的明細下方印出結算薪資
+        total_salary = salary_map[t_name]
+        if total_salary > 0:
+            lines.append(f"💰 預估薪水：{total_salary:,} 元")
             
     if not has_data:
         lines.append("目前沒有找到任何業績資料。")
