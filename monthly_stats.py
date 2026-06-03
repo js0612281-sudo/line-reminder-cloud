@@ -1,7 +1,7 @@
 # monthly_stats.py
 # 修改紀錄：
-# 1. 加入「防禦表情符號」邏輯：利用正則表達式只擷取減號前方的「純數字」作為對應依據。
-# 2. 自動忽略標題前綴的圖示、空白與中文字 (如 "外", "內")，大幅提高容錯率。
+# 1. 新增「小兒」標籤辨識 (標題含"小兒")。
+# 2. 自動將「小兒」獨立統計，並依循既有邏輯排除於基本薪資計算之外。
 
 from __future__ import annotations
 import os
@@ -203,7 +203,7 @@ def get_all_stats_report_text(target_date: datetime) -> str:
     start, end = get_full_month_range(target_date)
     events = fetch_events_in_range(start, end, filter_by_me=False, title_prefix=None)
     
-    # 【治療師代號對照表】(現在都改用純數字對應了！)
+    # 【治療師代號對照表】
     PREFIX_MAP = {
         "5": ("品萱", "5", "班內"),
         "6": ("品萱", "6", "班外"),
@@ -237,22 +237,25 @@ def get_all_stats_report_text(target_date: datetime) -> str:
         # 1. 取出減號前方的字串
         prefix_raw = title.split("-")[0].strip()
         
-        # 2. 只要裡面的純數字！(免疫所有表情符號和 "外/內" 等中文字)
+        # 2. 只要裡面的純數字！
         m_prefix = re.search(r'\d+', prefix_raw)
         if not m_prefix: 
-            continue # 如果沒有數字 (例如只有圖案)，就不處理
-        prefix = m_prefix.group(0) # 得到 "5", "8", "21" 等
+            continue 
+        prefix = m_prefix.group(0)
         
         a, b, c, d = count_session_from_title(title)
         
         if a == 0 and b == 0 and c == 0 and d == 0:
             continue
             
+        # 3. 檢查特殊標籤 (包含皮拉提斯、側彎、小兒)
         tag = ""
         if "皮拉" in title:
             tag = "（皮拉提斯）"
         elif "側彎" in title:
             tag = "（側彎）"
+        elif "小兒" in title:
+            tag = "（小兒）"
             
         if prefix in PREFIX_MAP:
             t_name, base_code, shift_name = PREFIX_MAP[prefix]
@@ -266,6 +269,7 @@ def get_all_stats_report_text(target_date: datetime) -> str:
                 k = f"{base_code} {shift_name}{duration_name}{tag}" if shift_name else f"{base_code} {duration_name}{tag}"
                 stats_map[t_name][k] = stats_map[t_name].get(k, 0) + count
                 
+                # 計算薪水：tag為空(代表非皮拉提斯/側彎/小兒) 才會算進基本薪水
                 if tag == "" and shift_name in SALARY_RATES:
                     salary_map[t_name] += (SALARY_RATES[shift_name][duration_name] * count)
 
@@ -290,6 +294,7 @@ def get_all_stats_report_text(target_date: datetime) -> str:
         tag_score = 0
         if "皮拉" in k: tag_score = 1
         elif "側彎" in k: tag_score = 2
+        elif "小兒" in k: tag_score = 3
         
         return (base_code, dur_score, tag_score)
         
